@@ -1,0 +1,35 @@
+[package]
+name = "danqing-logfile"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+description = "丹青日志文件引擎 —— mmap + 行步进索引 + 全文正则搜索 + JSONL 列化"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+# 编码检测与转码 (兄弟 crate, 零 UI 依赖)
+danqing-encoding = { git = "https://github.com/14uncle/danqing-encoding" }
+log = "0.4"
+anyhow = "1"
+memmap2 = "0.9"
+memchr = "2"
+regex = "1"
+# preserve_order: Object 底层换 IndexMap 保插入序, 列发现的「首见顺序」才有意义
+serde_json = { version = "1", features = ["preserve_order"] }
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 2
+
+[profile.release]
+lto = "fat"
+codegen-units = 1
+opt-level = "z"
+panic = "abort"
+strip = "debuginfo"
+
+# 本地联动开发：git 依赖透明替换为本地副本。
+[patch."https://github.com/14uncle/danqing-encoding"]
+danqing-encoding = { path = "../danqing-encoding" }
