@@ -123,7 +123,7 @@ fn snapshot_stat(file: &File, file_bytes: u64, head_hash: u64) -> FileStat {
 /// 步进索引步长: 每 STRIDE 行记一个绝对偏移, 段内 memchr 前扫定位。
 /// 16 = 内存 (3.2MB/GB) 与随机访问 (前扫 ≤15 行 ≈ 2.7KB) 的实测平衡点,
 /// 退化预案 stride=8 见 tasks/plan.md 决策 1。
-const INDEX_STRIDE: u64 = 16;
+const INDEX_STRIDE: u64 = 8;
 
 /// 并行索引阈值: 小于此单线程 (线程调度开销回不来, 64MB 串行 ≈ 27ms)。
 const PARALLEL_MIN_BYTES: usize = 64 << 20;
@@ -353,7 +353,7 @@ impl LogFile {
         let seg = self.segment_of_line(i);
         let local = i - seg.base_line;
         let mut start = seg.strides[(local / INDEX_STRIDE) as usize] as usize;
-        for _ in 0..(local % INDEX_STRIDE) {
+        for _ in 0..(local & (INDEX_STRIDE - 1)) {
             // 索引由同一份数据建出, 扫描必命中; None 分支为防御 (索引一致性不信赖)
             match memchr::memchr(b'\n', &data[start..]) {
                 Some(p) => start += p + 1,
@@ -419,7 +419,7 @@ impl LogFile {
         let seg = self.segment_of_line(start_line);
         let local = start_line - seg.base_line;
         let mut start = seg.strides[(local / INDEX_STRIDE) as usize] as usize;
-        for _ in 0..(local % INDEX_STRIDE) {
+        for _ in 0..(local & (INDEX_STRIDE - 1)) {
             match memchr::memchr(b'\n', &data[start..]) {
                 Some(p) => start += p + 1,
                 None => break,
@@ -669,8 +669,8 @@ fn scan_chunk(
     total_len: u64,
     hooks: &IndexHooks,
 ) -> (Vec<u64>, u64) {
-    // 预分配: 经验值 ~64 字节/行 + 步进 16, 避免 Vec 反复扩容
-    let mut strides = Vec::with_capacity(slice.len() / 64 / INDEX_STRIDE as usize + 16);
+    // 预分配: 经验值 ~48 字节/行 + 步进, 避免 Vec 反复扩容
+    let mut strides = Vec::with_capacity(slice.len() / 48 / INDEX_STRIDE as usize + 16);
     let mut count = 0u64;
     if is_first && !slice.is_empty() {
         let bom = if slice.starts_with(&[0xEF, 0xBB, 0xBF]) {
@@ -687,7 +687,7 @@ fn scan_chunk(
         if next == total_len {
             break; // 末尾换行不产生新行
         }
-        if count % INDEX_STRIDE == 0 {
+        if count & (INDEX_STRIDE - 1) == 0 {
             strides.push(next);
         }
         count += 1;
@@ -736,7 +736,7 @@ fn append_index(
         }
         let last = segments.last_mut().expect("上一行保证非空");
         let local = count - last.base_line;
-        if local % INDEX_STRIDE == 0 {
+        if local & (INDEX_STRIDE - 1) == 0 {
             last.strides.push(old_len as u64);
         }
         count += 1;
@@ -751,7 +751,7 @@ fn append_index(
         }
         let last = segments.last_mut().expect("旧文件非空必有段");
         let local = count - last.base_line;
-        if local % INDEX_STRIDE == 0 {
+        if local & (INDEX_STRIDE - 1) == 0 {
             last.strides.push((abs + 1) as u64);
         }
         count += 1;
@@ -959,8 +959,9 @@ mod tests {
 
     #[test]
     fn stride_index_memory_bound() {
-        // 10 万行: 稠密 u64 索引 = 800KB; 步进 16 索引 = 6,250 项 × 8B = 50KB。
+        // 10 万行: 稠密 u64 索引 = 800KB; 步进 8 索引 = 12,500 项 × 8B = 100KB。
         // T1 验收: 索引驻留从 48MB/GB 压到 ≤16MB/GB (本测试的缩小比例尺)。
+        // 阈值 110KB: INDEX_STRIDE=8 时 100KB 理论值 + 10% 容差
         let mut content = Vec::new();
         for _ in 0..100_000 {
             content.extend_from_slice(b"line-of-some-text\n");
@@ -968,8 +969,8 @@ mod tests {
         let lf = open_with(&content);
         assert_eq!(lf.line_count(), 100_000);
         assert!(
-            lf.stats().index_bytes <= 60_000,
-            "步进索引驻留应 ≤60KB (稠密索引为 800KB): 实测 {}",
+            lf.stats().index_bytes <= 110_000,
+            "步进索引驻留应 ≤110KB (稠密索引为 800KB): 实测 {}",
             lf.stats().index_bytes
         );
     }

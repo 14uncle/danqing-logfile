@@ -12,6 +12,11 @@
 
 use crate::logfile::LogFile;
 
+/// 并行过滤阈值: 剩余行数 ≥此值时启用多线程分段过滤 (经验值: 小文件单线程更简洁)。
+const PARALLEL_FILTER_THRESHOLD: u64 = 100_000;
+/// 并行过滤最大线程数 (避免线程过多导致调度开销大于收益)。
+const MAX_FILTER_THREADS: usize = 8;
+
 /// 列描述: 字段名 + 展示宽度 (字符数, 采样最大值, [4, 32] 截断)。
 #[derive(Debug, Clone)]
 pub struct Column {
@@ -447,7 +452,7 @@ fn line_matches(line: &[u8], clauses: &[Compiled]) -> bool {
 }
 
 /// 全文字段过滤: 顺序走一遍 (lines() 迭代器, 每行 O(1)), 返回命中行号 (升序)。
-/// 单线程: 实测 1GB/483 万行量级 < 1s 则不并行 (简洁优先)。
+/// 大文件 (≥64MB) 走分段并行, 小文件单线程 (简洁优先)。
 /// 禁用 line(i) 逐行随机访问 —— 步进索引下每次定位带段内前扫, 全量遍历会
 /// 把成本乘进行数 (T1 实测回归 235ms → 1072ms 的教训, 见 logfile.rs::lines 注释)。
 pub fn run_filter(file: &LogFile, clauses: &[Clause]) -> Vec<u64> {
@@ -461,11 +466,68 @@ pub fn run_filter_from(file: &LogFile, clauses: &[Clause], start_line: u64) -> V
     if compiled.is_empty() {
         return (start_line..file.line_count()).collect();
     }
-    let mut hits = Vec::new();
-    for (i, line) in file.lines_from(start_line) {
-        if line_matches(line, &compiled) {
-            hits.push(i);
+    let total = file.line_count();
+    if start_line >= total {
+        return Vec::new();
+    }
+    let remaining = total - start_line;
+    if remaining < PARALLEL_FILTER_THRESHOLD {
+        // 小文件单线程 (阈值以下并行开销大于收益)
+        let mut hits = Vec::new();
+        for (i, line) in file.lines_from(start_line) {
+            if line_matches(line, &compiled) {
+                hits.push(i);
+            }
         }
+        return hits;
+    }
+    // 大文件并行: 按行等分, 每线程过滤一段, 合并结果
+    // 分段策略: 按行等分保证每线程工作量相近, 合并时按序拼接保行号升序
+    let threads = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1)
+        .min(MAX_FILTER_THREADS);
+    if threads <= 1 {
+        let mut hits = Vec::new();
+        for (i, line) in file.lines_from(start_line) {
+            if line_matches(line, &compiled) {
+                hits.push(i);
+            }
+        }
+        return hits;
+    }
+    let chunk = remaining.div_ceil(threads as u64);
+    let compiled = &compiled;
+    let mut all_hits: Vec<Vec<u64>> = Vec::with_capacity(threads);
+    std::thread::scope(|s| {
+        let mut handles = Vec::new();
+        for t in 0..threads {
+            let begin = start_line + t as u64 * chunk;
+            let end = (begin + chunk).min(total);
+            if begin >= total {
+                break;
+            }
+            handles.push(s.spawn(move || {
+                let mut hits = Vec::new();
+                for (i, line) in file.lines_from(begin) {
+                    if i >= end {
+                        break;
+                    }
+                    if line_matches(line, compiled) {
+                        hits.push(i);
+                    }
+                }
+                hits
+            }));
+        }
+        for h in handles {
+            all_hits.push(h.join().expect("过滤线程 panic"));
+        }
+    });
+    // 合并: 已按顺序, 直接拼接
+    let mut hits = Vec::new();
+    for h in all_hits {
+        hits.extend(h);
     }
     hits
 }
