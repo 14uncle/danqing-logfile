@@ -188,6 +188,40 @@ fn field_needle(key: &str) -> Vec<u8> {
 /// 扁平字段提取: 返回值 token 切片 (字符串去引号, 数字/bool/null 原样)。
 /// 前缀校验: key 之前 (跳过空白) 必须是 `{` 或 `,`, 挡住行内裸文本误配的一半。
 /// 仅供**过滤粗筛** (T2 两段架构); 显示路径已换真 parser (见 [`parse_line`])。
+/// 预构造的字段提取器: needle 与 memmem 的 prefilter **都只建一次**。
+///
+/// **为什么必须有它** (2026-09-13): [`extract_field`] 每次调用都重建 needle
+/// (分配一个 `Vec`, 见 [`field_needle`]) **并且**重建 `memchr::memmem::Finder`
+/// (对 needle 做一次 prefilter 分析)。逐行调用时这两笔固定开销会成为整个扫描的
+/// 成本主体 —— 用户实机实测 (debug 构建, 20 线程可用, 同一台机器):
+///
+/// | 口径 | 文件 | 行数 | 耗时 |
+/// |---|---|---|---|
+/// | 字段口径 (逐行 `extract_field`) | 1 GB JSONL | 483 万 | **9312 ms** |
+/// | 行口径 (`memchr3` 直扫) | 1 GB 明文 | 635 万 | **417 ms** |
+///
+/// **22 倍** —— 而字段口径扫的字节数其实**更少** (找到 `"level":` 即返回)。
+/// 故慢的从来不是扫描, 是每行的两次构造。
+pub struct FieldExtractor {
+    needle: Vec<u8>,
+    finder: memchr::memmem::Finder<'static>,
+}
+
+impl FieldExtractor {
+    /// 为字段名构造 (needle 与 prefilter 各建一次, 之后逐行复用)。
+    pub fn new(key: &str) -> Self {
+        let needle = field_needle(key);
+        let finder = memchr::memmem::Finder::new(&needle).into_owned();
+        Self { needle, finder }
+    }
+
+    /// 提取该字段的值 token —— 语义与 [`extract_field`] **完全一致**
+    /// (由 `field_extractor_matches_extract_field` 差分钉着)。
+    pub fn extract<'a>(&self, line: &'a [u8]) -> Option<&'a [u8]> {
+        next_field_value_with(line, &self.needle, &self.finder, 0).map(|(v, _)| v)
+    }
+}
+
 pub fn extract_field<'a>(line: &'a [u8], key: &str) -> Option<&'a [u8]> {
     extract_with_needle(line, &field_needle(key))
 }
@@ -261,13 +295,21 @@ fn flatten_into(label: &str, val: &serde_json::Value, depth: usize, out: &mut Ve
 
 /// 找下一个带合法前缀的字段值 token: 返回 (值 token, 下一搜索起点)。
 /// 前缀校验: key 之前 (跳过空白) 必须是 `{` 或 `,`。字符串去引号, 数字/bool/null 原样。
-fn next_field_value<'a>(
+fn next_field_value<'a>(line: &'a [u8], needle: &[u8], from: usize) -> Option<(&'a [u8], usize)> {
+    // 一次性入口: 每次调用都重建 Finder。**逐行调用请走 [`FieldExtractor`]** ——
+    // 那笔固定开销在循环里会成为成本主体 (见该类型的文档)。
+    next_field_value_with(line, needle, &memchr::memmem::Finder::new(needle), from)
+}
+
+/// [`next_field_value`] 的核心: 搜索器由调用方预构造。
+fn next_field_value_with<'a>(
     line: &'a [u8],
     needle: &[u8],
+    finder: &memchr::memmem::Finder<'_>,
     mut from: usize,
 ) -> Option<(&'a [u8], usize)> {
     loop {
-        let pos = memchr::memmem::find(&line[from..], needle)? + from;
+        let pos = finder.find(&line[from..])? + from;
         let mut i = pos;
         let prefix_ok = loop {
             if i == 0 {
@@ -422,10 +464,17 @@ enum Compiled {
     /// 裸词: 整行子串 (memmem)。
     Bare(Vec<u8>),
     /// 扁平等值/前缀: memmem 提取值 token 直通, 零 parse (POC 性能路径)。
+    ///
+    /// `finder` 与 `needle` 同源、构造期一次建好 —— **不要**在逐行路径里用
+    /// [`extract_field`] 那种每次重建搜索器的写法 (实测差 20 倍以上, 见
+    /// [`FieldExtractor`] 的文档)。
     Flat {
         needle: Vec<u8>,
         op: Op,
         value: String,
+        /// `Box` 化了: `Finder` 内含 prefilter 表, 直接内联会把本枚举撑到
+        /// clippy 的 `large_enum_variant` 阈值; 每条子句只解一次引用, 代价可忽略。
+        finder: Box<memchr::memmem::Finder<'static>>,
     },
     /// 需 parse 验证 (点路径或比较算子): 粗筛最内层 key + serde_json 导航比较。
     Verify {
@@ -506,9 +555,13 @@ fn navigate<'a>(mut val: &'a serde_json::Value, path: &[String]) -> Option<&'a s
 fn line_matches(line: &[u8], clauses: &[Compiled]) -> bool {
     clauses.iter().all(|c| match c {
         Compiled::Bare(w) => memchr::memmem::find(line, w).is_some(),
-        Compiled::Flat { needle, op, value } => {
-            extract_with_needle(line, needle).is_some_and(|v| token_matches(v, *op, value))
-        }
+        Compiled::Flat {
+            needle,
+            op,
+            value,
+            finder,
+        } => next_field_value_with(line, needle, finder, 0)
+            .is_some_and(|(v, _)| token_matches(v, *op, value)),
         Compiled::Verify {
             needle,
             path,
@@ -621,6 +674,7 @@ fn compile(c: &Clause) -> Compiled {
             // 扁平字段 (任意算子) → token 直通零 parse; 点路径 → 粗筛 + parse 验证
             if path.len() == 1 {
                 Compiled::Flat {
+                    finder: Box::new(memchr::memmem::Finder::new(&needle).into_owned()),
                     needle,
                     op: *op,
                     value: value.clone(),
@@ -947,6 +1001,42 @@ mod tests {
             Vec::<u64>::new(),
             "越界空"
         );
+    }
+
+    /// **FieldExtractor 与 extract_field 必须逐行一致** —— 前者只是把 needle 与
+    /// memmem 搜索器提到循环外, 语义一个字都不许变 (这是它可以替换后者的前提)。
+    #[test]
+    fn field_extractor_matches_extract_field() {
+        let fx = FieldExtractor::new("level");
+        let corpora: Vec<&[u8]> = vec![
+            br#"{"level":"ERROR","msg":"a"}"#,
+            br#"{"msg":"a","level":"INFO"}"#,
+            br#"{"nested":{"level":"WARN"},"level":"DEBUG"}"#,
+            br#"{"msg":"x ,"level":"ERROR" y","level":"INFO"}"#,
+            br#"{"level":"error"}"#,
+            br#"{"levelx":"INFO"}"#,
+            br#"{"a":1}"#,
+            b"",
+            b"plain text",
+            br#"{"level":"ERROR"}"#,
+            br#"{"level":"ERROR1","level":"WARN"}"#,
+            br#"{"level":123}"#,
+            br#"{"level":null}"#,
+            br#"  {"level" : "TRACE"}  "#,
+        ];
+        for &c in &corpora {
+            assert_eq!(
+                fx.extract(c),
+                extract_field(c, "level"),
+                "语料 {:?}",
+                String::from_utf8_lossy(c)
+            );
+        }
+        // 别的 key 也要一致
+        let fs = FieldExtractor::new("severity");
+        for &c in &corpora {
+            assert_eq!(fs.extract(c), extract_field(c, "severity"));
+        }
     }
 
     /// 采样**按字节**收手, 不按 512 行一路解析下去。
