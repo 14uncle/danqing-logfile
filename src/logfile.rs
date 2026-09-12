@@ -43,6 +43,16 @@ pub struct OpenStats {
     pub index_bytes: usize,
     /// 检出的原始编码 (状态栏展示; 数据实际编码见 [`LogFile::encoding`])。
     pub encoding: Encoding,
+    /// **打开的总墙钟** —— 从 `File::open` 到索引建完。
+    ///
+    /// 为什么必须有这个数: `map_us` 与 `index` 只覆盖 O(1) 映射与行索引两段, 而
+    /// UTF-16 的 `read` + `transcode` **不在任何一段里**。实测 100 MiB UTF-16LE:
+    /// 对外只报「索引 7 ms」, 实际 open 墙钟 200 ms (**13 倍**), GB 级按比例是秒级。
+    /// 把总数报出来, 用户看到的数字才等于他实际等的时间。
+    pub open: Duration,
+    /// 索引前的预处理耗时 (UTF-16 = 读整个文件 + 转码; 其余编码恒 0)。
+    /// 单独成项是为了让「总墙钟 - mmap - 索引 - 预处理」的残差一眼可见。
+    pub preprocess: Duration,
 }
 
 impl OpenStats {
@@ -252,6 +262,7 @@ impl LogFile {
     /// 「索引已取消」Err —— 半成品索引永不交给调用方。UTF-16 转码副本
     /// 路径无细粒度进度 (read/transcode 两段各一次取消检查)。
     pub fn open_with_hooks(path: &Path, hooks: &IndexHooks) -> Result<Self> {
+        let t_open = Instant::now();
         let t0 = Instant::now();
         let file = File::open(path).with_context(|| format!("打开文件失败: {}", path.display()))?;
         let file_bytes = file.metadata().context("读取文件元信息失败")?.len();
@@ -263,17 +274,20 @@ impl LogFile {
         let detected = danqing_encoding::detect(head);
         // 快照首块指纹 (磁盘原字节, map 期取定; UTF-16 转码前同样成立)
         let head_hash = fnv_head(&map[..map.len().min(64)]);
-        let (data, data_enc) = if detected.is_utf16() {
-            // 2 字节编码不适合字节级索引: 一次性转码 UTF-8 副本 (1GB UTF-16 ≈ 500MB UTF-8)
+        let (data, data_enc, preprocess) = if detected.is_utf16() {
+            // 2 字节编码不适合字节级索引: 一次性转码 UTF-8 副本 (1GB UTF-16 ≈ 500MB UTF-8)。
+            // 这段是读整文件 + 建 Vec<u16> + 编 UTF-8, **不进 map_us / index** ——
+            // 故必须单独计时并在 `OpenStats::open` 里如实报出 (见该字段注释)。
+            let t_pre = Instant::now();
             let raw =
                 std::fs::read(path).with_context(|| format!("读取文件失败: {}", path.display()))?;
             hooks.check_cancelled()?;
             drop(map);
             let utf8 = danqing_encoding::transcode_utf16(detected == Encoding::Utf16Le, &raw);
             hooks.check_cancelled()?;
-            (FileData::Owned(utf8), Encoding::Utf8)
+            (FileData::Owned(utf8), Encoding::Utf8, t_pre.elapsed())
         } else {
-            (FileData::Mapped(map), detected)
+            (FileData::Mapped(map), detected, Duration::ZERO)
         };
 
         let t1 = Instant::now();
@@ -291,6 +305,8 @@ impl LogFile {
             line_count,
             index_bytes,
             encoding: detected,
+            open: t_open.elapsed(),
+            preprocess,
         };
         Ok(Self {
             data,
@@ -322,6 +338,8 @@ impl LogFile {
                 line_count: 0,
                 index_bytes: 0,
                 encoding: Encoding::Utf8,
+                open: Duration::ZERO,
+                preprocess: Duration::ZERO,
             },
         }
     }
@@ -574,6 +592,9 @@ impl LogFile {
             line_count,
             index_bytes,
             encoding: old.stats.encoding,
+            // 追加的总墙钟 (含退化重建时的读+转码) —— 与 open 同语义
+            open: t0.elapsed(),
+            preprocess: old.stats.preprocess,
         };
         Ok(AppendOutcome::Appended(Self {
             data: FileData::Mapped(map),
@@ -1026,6 +1047,8 @@ mod tests {
                 line_count,
                 index_bytes: 0,
                 encoding: Encoding::Utf8,
+                open: Duration::ZERO,
+                preprocess: Duration::ZERO,
             },
         }
     }
