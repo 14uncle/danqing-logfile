@@ -36,6 +36,33 @@ const DETECT_SAMPLE: u64 = 64;
 const SCHEMA_SAMPLE: u64 = 512;
 /// 列数上限。
 const MAX_COLUMNS: usize = 16;
+/// 采样的**字节**预算 (2026-09-12 加)。
+///
+/// 只按行数采样时, 行一宽成本就无界: 实测 200 MiB / 563 KiB 行 / 每行含上万
+/// 小对象 的文件, 列发现要 **3.2 s** (serde_json 解析这种形状只有 ~60 MB/s),
+/// 按 512 行采样等于要解析几百 MiB —— 用户看到的就是「索引 17ms 却等了十几秒」。
+/// 加字节预算后同一文件降到几十毫秒。
+///
+/// 行宽 ≤ 8 KiB 时预算不生效 (512 行 × 8 KiB = 4 MiB), 故对普通日志**零影响**。
+const SCHEMA_SAMPLE_BYTES: usize = 4 << 20;
+/// 检测采样的字节预算 (同上, 64 行 × 32 KiB = 2 MiB 才可能触顶)。
+const DETECT_SAMPLE_BYTES: usize = 2 << 20;
+/// 预算之下的**最少**采样行数 —— 证据不足不判 (detect 另有 nonempty ≥ 3 的判据)。
+const MIN_SAMPLE_LINES: u64 = 6;
+/// 列宽 (字符数) 的钳制上下界 —— **列发现只需量到这个上界**。
+///
+/// 这个常量是 `discover_schema` 里宽度探测的**唯一依据**: 既然结果钳到
+/// [`WIDTH_CLAMP`], 量值宽度就只需要前 [`WIDTH_CLAMP`] 个字符, 多的部分
+/// 算了也会被丢掉 (2026-09-12 修: 之前对每个字符串值 `chars().count()`
+/// 走完全文、对每个对象/数组先 `to_string()` 整棵序列化再逐字符数 ——
+/// 行内值一大, 列发现就成了整个打开路径里最慢的一步)。
+const WIDTH_CLAMP: usize = 32;
+/// 非字符串值宽度探测的字节上界 (有界序列化)。
+///
+/// 超界即按「≥ [`WIDTH_CLAMP`]」处理 —— 256 字节的 UTF-8 至少 85 个字符,
+/// 远大于 32, **钳制后与「整棵序列化再逐字符数」结果相同**, 但不再为一个大
+/// 对象分配一整棵序列化字符串。
+const WIDTH_PROBE_BYTES: usize = 256;
 /// 判定为 JSONL 的 object 行占比下限。
 const DETECT_THRESHOLD: f64 = 0.9;
 
@@ -45,8 +72,13 @@ pub fn detect(file: &LogFile) -> bool {
     let n = file.line_count().min(DETECT_SAMPLE);
     let mut nonempty = 0u64;
     let mut objects = 0u64;
+    let mut sampled_bytes = 0usize;
     for i in 0..n {
+        if i >= MIN_SAMPLE_LINES && sampled_bytes >= DETECT_SAMPLE_BYTES {
+            break; // 字节预算到顶: 大行文件不能让检测去解析几百 MiB
+        }
         let line = file.line(i);
+        sampled_bytes += line.len();
         if line.is_empty() {
             continue;
         }
@@ -61,27 +93,74 @@ pub fn detect(file: &LogFile) -> bool {
 /// 列发现: 采样前 SCHEMA_SAMPLE 行, 按首见顺序收顶层 key (≤MAX_COLUMNS 列)。
 /// 宽度 = max(字段名长度, 采样值展示长度), 截到 [4, 32]。
 /// 非 JSONL / 采样零列 → None。
+/// 单元格值宽度 (字符数), **有界**到 [`WIDTH_CLAMP`] 以上即可。
+///
+/// 字符串取前 `WIDTH_CLAMP + 1` 个字符; 其余类型用有界序列化 ([`compact_prefix`]),
+/// 超界直接返回 `WIDTH_CLAMP + 1`。三种情形经 `clamp(4, WIDTH_CLAMP)` 之后,
+/// 与「完整序列化再逐字符数」**完全等价** —— 这是可以这样省的前提。
+fn value_width(value: &serde_json::Value) -> usize {
+    match value {
+        serde_json::Value::String(s) => s.chars().take(WIDTH_CLAMP + 1).count(),
+        other => match compact_prefix(other, WIDTH_PROBE_BYTES) {
+            Some(bytes) => String::from_utf8_lossy(&bytes).chars().count(),
+            None => WIDTH_CLAMP + 1,
+        },
+    }
+}
+
+/// 有界紧凑序列化: 收集至多 `cap` 字节; 超出返回 `None` (调用方按「很宽」处理)。
+///
+/// 为什么不用 `to_string()`: 对象/数组的紧凑形式可能比整个文件还大, 而我们只
+/// 需要前几十个字符。写进一个到顶即报错的 `Write` 就既拿到了前缀、又不会把
+/// 整棵序列化结果留在内存里。
+fn compact_prefix(value: &serde_json::Value, cap: usize) -> Option<Vec<u8>> {
+    struct CapWriter {
+        buf: Vec<u8>,
+        cap: usize,
+    }
+    impl std::io::Write for CapWriter {
+        fn write(&mut self, data: &[u8]) -> std::io::Result<usize> {
+            if self.buf.len() + data.len() > self.cap {
+                return Err(std::io::Error::other("宽度探测超界"));
+            }
+            self.buf.extend_from_slice(data);
+            Ok(data.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut w = CapWriter {
+        buf: Vec::new(),
+        cap,
+    };
+    serde_json::to_writer(&mut w, value).ok()?;
+    Some(w.buf)
+}
+
 pub fn discover_schema(file: &LogFile) -> Option<Schema> {
     let n = file.line_count().min(SCHEMA_SAMPLE);
     let mut columns: Vec<Column> = Vec::new();
+    let mut sampled_bytes = 0usize;
     for i in 0..n {
-        let Ok(serde_json::Value::Object(map)) =
-            serde_json::from_slice::<serde_json::Value>(file.line(i))
+        if i >= MIN_SAMPLE_LINES && sampled_bytes >= SCHEMA_SAMPLE_BYTES {
+            break; // 字节预算到顶 (见 SCHEMA_SAMPLE_BYTES)
+        }
+        let raw = file.line(i);
+        sampled_bytes += raw.len();
+        let Ok(serde_json::Value::Object(map)) = serde_json::from_slice::<serde_json::Value>(raw)
         else {
             continue;
         };
         for (key, value) in &map {
-            let shown_len = match value {
-                serde_json::Value::String(s) => s.chars().count(),
-                other => other.to_string().chars().count(),
-            };
+            let shown_len = value_width(value);
             match columns.iter_mut().find(|c| c.name == *key) {
                 Some(col) => col.width_chars = col.width_chars.max(shown_len),
                 None => {
                     if columns.len() < MAX_COLUMNS {
                         columns.push(Column {
                             name: key.clone(),
-                            width_chars: key.chars().count().max(shown_len),
+                            width_chars: key.chars().take(WIDTH_CLAMP + 1).count().max(shown_len),
                         });
                     }
                 }
@@ -92,7 +171,7 @@ pub fn discover_schema(file: &LogFile) -> Option<Schema> {
         return None;
     }
     for c in &mut columns {
-        c.width_chars = c.width_chars.clamp(4, 32);
+        c.width_chars = c.width_chars.clamp(4, WIDTH_CLAMP);
     }
     Some(Schema { columns })
 }
@@ -867,6 +946,93 @@ mod tests {
             run_filter_from(&lf, &clauses, 99),
             Vec::<u64>::new(),
             "越界空"
+        );
+    }
+
+    /// 采样**按字节**收手, 不按 512 行一路解析下去。
+    ///
+    /// 这条钉的是「列发现成本有界」这个不变量: 去掉字节预算它就会红 —— 那时
+    /// 一个大行文件会解析整窗几百 MiB, 正是 2026-09-12「索引 17ms 却等了十几秒」
+    /// 的成因 (实测 200 MiB / 563 KiB 行: 3.17s → 71ms)。
+    ///
+    /// 代价是**有意的**: 预算窗口之外的列不会被发现, 故断言写成「窗外的列不出现」。
+    /// 行宽 ≤ 8 KiB 时预算不生效, 普通日志不受影响 (见 `SCHEMA_SAMPLE_BYTES`)。
+    #[test]
+    fn schema_sampling_stops_at_byte_budget() {
+        let big = "x".repeat(1024 * 1024); // 每行 ~1 MiB
+        let mut content = Vec::new();
+        for i in 0..40 {
+            // 第 30 行才出现的列: 落在预算窗口 (\(4 MiB / 1 MiB =) 4~6 行) 之外
+            let extra = if i == 30 { r#","late":"y""# } else { "" };
+            content.extend_from_slice(
+                format!(r#"{{"ts":"T","level":"INFO"{extra},"blob":"{big}"}}"#).as_bytes(),
+            );
+            content.push(b'\n');
+        }
+        let f = open_with(&content);
+        let s = discover_schema(&f).expect("检出 schema");
+        for want in ["ts", "level", "blob"] {
+            assert!(
+                s.columns.iter().any(|c| c.name == want),
+                "窗内列 {want} 要认"
+            );
+        }
+        assert!(
+            !s.columns.iter().any(|c| c.name == "late"),
+            "预算之外的列不得发现 —— 有界成本的代价, 有意为之"
+        );
+    }
+
+    /// 值宽度探测: 有界版必须与「完整序列化再逐字符数」在**钳制后**逐值相等 ——
+    /// 这是「只量前 32 个字符 / 有界序列化」可以成立的前提。
+    #[test]
+    fn bounded_value_width_equals_unbounded_after_clamp() {
+        fn unbounded(v: &serde_json::Value) -> usize {
+            match v {
+                serde_json::Value::String(s) => s.chars().count(),
+                other => other.to_string().chars().count(),
+            }
+        }
+        let cases = vec![
+            serde_json::json!(""),
+            serde_json::json!("a"),
+            serde_json::json!("exactly-thirty-two-chars-long!"),
+            serde_json::json!("x".repeat(50_000)),
+            serde_json::json!("日本語のテキスト"),
+            serde_json::json!(1),
+            serde_json::json!(true),
+            serde_json::json!(null),
+            serde_json::json!(12345678901234567890u64),
+            serde_json::json!({}),
+            serde_json::json!([]),
+            serde_json::json!({"a": 1}),
+            serde_json::json!([1, 2, 3]),
+            serde_json::json!({"k": "日本語"}),
+            serde_json::json!({"nested": {"deep": "y".repeat(40_000)}}),
+            serde_json::json!((0..500).collect::<Vec<i32>>()),
+        ];
+        for v in cases {
+            let want = unbounded(&v).clamp(4, WIDTH_CLAMP);
+            let got = value_width(&v).clamp(4, WIDTH_CLAMP);
+            assert_eq!(got, want, "值 {v} 钳制后不等");
+        }
+    }
+
+    /// 装得下时, 有界序列化必须给出**精确**前缀 (不能被上界粗暴吞成「很宽」)。
+    #[test]
+    fn compact_prefix_is_exact_when_it_fits() {
+        let p = |v: &serde_json::Value, cap: usize| {
+            compact_prefix(v, cap).map(|b| String::from_utf8_lossy(&b).into_owned())
+        };
+        assert_eq!(
+            p(&serde_json::json!({"a": 1}), 256).as_deref(),
+            Some(r#"{"a":1}"#)
+        );
+        assert_eq!(p(&serde_json::json!([1, 2]), 256).as_deref(), Some("[1,2]"));
+        assert_eq!(p(&serde_json::json!("s"), 256).as_deref(), Some(r#""s""#));
+        assert!(
+            p(&serde_json::json!({"k": "y".repeat(1000)}), 16).is_none(),
+            "超界须返回 None 而不是截断的前缀 (截断的 JSON 数出来的字符数没意义)"
         );
     }
 
