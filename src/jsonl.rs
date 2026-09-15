@@ -9,6 +9,9 @@
 //! 显示路径 (T1): 逐可见行 serde_json parse (真 parser, 恒定成本), 嵌套值紧凑显示;
 //! 过滤路径: 扁平等值/前缀走 memmem 粗筛零 parse (性能), 点路径/比较算子才
 //! parse 验证 (T2 两段架构)。memmem 提取 (`extract_field`) 仅供过滤粗筛, 不再进显示。
+//! 匹配一律 **ASCII 大小写不敏感** (2026-09-15): 裸词走 [`contains_ascii_ci`],
+//! 值比较走 `eq_ignore_ascii_case` (等值) / [`starts_with_ascii_ci`] (前缀);
+//! 键的 needle 保持精确, 由产品侧按列名规范化。
 
 use crate::logfile::LogFile;
 
@@ -385,9 +388,9 @@ fn field_value_matches(line: &[u8], needle: &[u8], op: Op, value: &str) -> bool 
 /// 比较算子。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Op {
-    /// `=` 全等。
+    /// `=` 等值 (**ASCII 大小写不敏感**, 非字节全等 —— 见 `token_matches`)。
     Eq,
-    /// `=...*` 前缀通配。
+    /// `=...*` 前缀通配 (**同样不敏感**)。
     Prefix,
     /// `>` 数值大于。
     Gt,
@@ -409,13 +412,47 @@ pub enum Clause {
         op: Op,
         value: String,
     },
-    /// 裸词: 整行子串。
+    /// 裸词: 整行子串, ASCII 大小写不敏感。
     Bare(String),
 }
 
 /// 解析查询: 空白分词, 含算子 (`= >= <= > <`) 为字段子句, 否则裸词。AND 语义。
 pub fn parse_query(q: &str) -> Vec<Clause> {
     q.split_whitespace().map(parse_clause).collect()
+}
+
+/// 按 schema 的真实列名规范化子句键名 (仅**单段** path), 使 `LEVEL=ERROR` 也能命中
+/// `"level"` 列。
+///
+/// **为什么要改写而不是让键也走不敏感匹配**: 键的 needle 是精确的 memmem 前缀
+/// (`,"level":"`), 粗筛必须保持精确才能零 parse 直通。让键走不敏感正则实测
+/// 1GB 1822ms (**22x 退化** —— prefilter 被每个键名开头的 `"`+字母打爆, spec D5 禁路);
+/// 而拿用户键名到列发现结果里查一次表是零成本。
+///
+/// 查无此列 → **保持原样** (自然 0 命中, 语义正确 —— 不猜、不报错, 与列发现
+/// 「找不到级别列就降级只读」同一条保守原则)。
+///
+/// **多段 path (点路径/嵌套键) 不动**: 嵌套键不在列发现表层, 逐层扫 IndexMap
+/// 做不敏感查表不值当 (spec D6 边界, 写明为敏感)。
+pub fn normalize_clause_keys(clauses: &mut [Clause], schema: &Schema) {
+    for c in clauses.iter_mut() {
+        let Clause::Field { path, .. } = c else {
+            continue;
+        };
+        let [name] = path.as_mut_slice() else {
+            continue; // 空路径或多段: 均不在本函数的职责内
+        };
+        if let Some(col) = schema
+            .columns
+            .iter()
+            .find(|c| c.name.eq_ignore_ascii_case(name))
+        {
+            // 大小写本就一致时不做无谓重分配 (且让「已是正确写法 = 无操作」显式)
+            if col.name != *name {
+                *name = col.name.clone();
+            }
+        }
+    }
 }
 
 /// 单 token → 子句。
@@ -461,7 +498,7 @@ fn split_operator(tok: &str) -> Option<(&str, Op, &str)> {
 
 /// 预编译子句 (needle 只造一次, 过滤循环零分配)。
 enum Compiled {
-    /// 裸词: 整行子串 (memmem)。
+    /// 裸词: 整行子串, **ASCII 大小写不敏感** (2026-09-15; 见 [`contains_ascii_ci`])。
     Bare(Vec<u8>),
     /// 扁平等值/前缀: memmem 提取值 token 直通, 零 parse (POC 性能路径)。
     ///
@@ -485,13 +522,23 @@ enum Compiled {
     },
 }
 
-/// 值 token 匹配: Eq 全等, Prefix 前缀, 比较算子按数值 (token 解析, 非数值不匹配)。
+/// ASCII 大小写不敏感前缀 (按**字节**比对, 不要求 UTF-8 字符边界)。
+///
+/// `pub` 是因为**产品侧的级别分类器 (字段口径) 必须与过滤子句同口径** ——
+/// 桶可点, 点下去走 `col=WARN*` 的 Flat 前缀; 两边共用这一个原语, 「桶计数 ==
+/// 筛选结果」才是构造保证而不是碰巧 (spec D7 / SPEC-level-histogram D2 红线)。
+pub fn starts_with_ascii_ci(hay: &[u8], prefix: &[u8]) -> bool {
+    hay.len() >= prefix.len() && hay[..prefix.len()].eq_ignore_ascii_case(prefix)
+}
+
+/// 值 token 匹配: Eq 全等, Prefix 前缀 (**两者均 ASCII 大小写不敏感**, 2026-09-15),
+/// 比较算子按数值 (token 解析, 非数值不匹配) —— 数值算子**不受大小写逻辑影响**。
 /// 扁平直通与点路径粗筛共用。比较按 token 解析成 f64 —— 字符串 "500" 也会当数值 500,
 /// 与 parse 路径 (`compare_val`) 的严格字符串/数值区分有差异 (有意边界: 扁平比较是性能直通)。
 fn token_matches(token: &[u8], op: Op, target: &str) -> bool {
     match op {
-        Op::Eq => token == target.as_bytes(),
-        Op::Prefix => token.starts_with(target.as_bytes()),
+        Op::Eq => token.eq_ignore_ascii_case(target.as_bytes()),
+        Op::Prefix => starts_with_ascii_ci(token, target.as_bytes()),
         Op::Gt | Op::GtEq | Op::Lt | Op::LtEq => {
             let Some(n) = std::str::from_utf8(token)
                 .ok()
@@ -513,11 +560,12 @@ fn token_matches(token: &[u8], op: Op, target: &str) -> bool {
     }
 }
 
-/// 验证路径比较: 等值/前缀按显示串 ([`cell_display`]), 比较按数值 (非数值不匹配)。
+/// 验证路径比较: 等值/前缀按显示串 ([`cell_display`], **ASCII 大小写不敏感**),
+/// 比较按数值 (非数值不匹配)。**嵌套键 (路径段名) 保持精确** —— 见 [`normalize_clause_keys`]。
 fn compare_val(val: &serde_json::Value, op: Op, target: &str) -> bool {
     match op {
-        Op::Eq => cell_display(val) == target,
-        Op::Prefix => cell_display(val).starts_with(target),
+        Op::Eq => cell_display(val).eq_ignore_ascii_case(target),
+        Op::Prefix => starts_with_ascii_ci(cell_display(val).as_bytes(), target.as_bytes()),
         Op::Gt | Op::GtEq | Op::Lt | Op::LtEq => {
             let Some(n) = val.as_f64() else {
                 return false;
@@ -551,10 +599,48 @@ fn navigate<'a>(mut val: &'a serde_json::Value, path: &[String]) -> Option<&'a s
     Some(val)
 }
 
+/// ASCII 大小写不敏感子串查找 —— 裸词过滤专用 (`memmem` 没有不敏感模式)。
+///
+/// 结构照搬 memmem 的两段式: **SIMD 定位候选 + 常数验窗**。首字节取大小写双变体
+/// 交给 `memchr2` (首字节非字母时两变体同值, 退化为 `memchr`, 无额外代价),
+/// 命中位置再用 `eq_ignore_ascii_case` 验整个窗口。
+///
+/// **为什么手写不选 `(?i-u)` 正则**: 每行一次 regex VM 进入/退出在同一量级的
+/// 循环里是实打实的常数差; 本仓过滤路径通篇是 memchr 系惯用法, 不引第二种匹配机制。
+/// 代价是要自己保证正确性 —— 故单测用**正则 oracle 穷举对拍**钉死语义。
+///
+/// **非 ASCII 字节按字面比较, 不折叠** —— 与 `(?i-u)` 在字节面上的行为一致。
+/// 这是有意的: 非 UTF-8 文件 (GBK) 的过滤不过转码, 折叠只能在字节面做 (spec D4)。
+///
+/// **已知并接受的最坏情况**: 候选定位是 SIMD 的, 但验窗是线性的, 故单行内大量
+/// 重复字节 + 长裸词 (如 1 MiB 的 `a` 里找 `a…ab`) 在该行退化为 O(n·m)。
+/// 正常日志行长几百字节、且裸词也就几个字符, 到不了这个形状;
+/// 真撞上再按词长分流回 `memmem` (只对全小写词——那时无需折叠)。
+fn contains_ascii_ci(haystack: &[u8], needle: &[u8]) -> bool {
+    let Some((&first, rest)) = needle.split_first() else {
+        return true; // 空 needle 处处命中 —— 与 memmem::find 同语义
+    };
+    if needle.len() > haystack.len() {
+        return false;
+    }
+    // 候选窗口只到「再往后就放不下整个 needle」为止 —— 先切掉尾巴, 于是下面
+    // 每个候选位置都天然合法, 不必在循环里再判一次越界。
+    let windows = &haystack[..=haystack.len() - needle.len()];
+    // 两变体必须是 **lower 与 upper 一对**: 拿 `first` 配 `to_ascii_uppercase()`
+    // 在首字节本就是大写时两值相同, memchr2 退化成单字节搜索、漏掉小写候选
+    // (穷举 oracle 当场抓到 —— 非字母时两变体同值无害)。
+    memchr::memchr2_iter(
+        first.to_ascii_lowercase(),
+        first.to_ascii_uppercase(),
+        windows,
+    )
+    .any(|at| haystack[at + 1..at + needle.len()].eq_ignore_ascii_case(rest))
+}
+
 /// 单行判定: 全部子句命中 (AND)。
 fn line_matches(line: &[u8], clauses: &[Compiled]) -> bool {
     clauses.iter().all(|c| match c {
-        Compiled::Bare(w) => memchr::memmem::find(line, w).is_some(),
+        Compiled::Bare(w) => contains_ascii_ci(line, w),
         Compiled::Flat {
             needle,
             op,
@@ -906,6 +992,88 @@ mod tests {
     }
 
     #[test]
+    fn field_value_match_is_case_insensitive() {
+        let lf = open_with(
+            br#"{"level":"INFO","msg":"ok"}
+{"level":"ERROR","msg":"boom"}
+{"level":"WARNING","msg":"slow"}
+"#,
+        );
+        assert_eq!(run_filter(&lf, &parse_query("level=error")), vec![1]);
+        assert_eq!(run_filter(&lf, &parse_query("level=Error")), vec![1]);
+        assert_eq!(
+            run_filter(&lf, &parse_query("level=warn*")),
+            vec![2],
+            "前缀通配同样不敏感 (WARNING 命中 warn*)"
+        );
+        assert_eq!(run_filter(&lf, &parse_query("level=WARN*")), vec![2]);
+        // 数值算子不参与大小写逻辑, 行为不变
+        let num = open_with(b"{\"status\":500}\n{\"status\":\"error\"}\n");
+        assert_eq!(run_filter(&num, &parse_query("status>=500")), vec![0]);
+    }
+
+    #[test]
+    fn normalize_clause_keys_maps_to_real_column_name() {
+        let schema = Schema {
+            columns: vec![Column {
+                name: "level".into(),
+                width_chars: 5,
+            }],
+        };
+        let field = |p: &str, v: &str| Clause::Field {
+            path: vec![p.to_string()],
+            op: Op::Eq,
+            value: v.to_string(),
+        };
+
+        // 键名大小写不同 → 改写为列里的真实写法 (否则 memmem needle 精确匹配不上)
+        let mut c = parse_query("LEVEL=ERROR");
+        normalize_clause_keys(&mut c, &schema);
+        assert_eq!(c, vec![field("level", "ERROR")]);
+
+        // 查无此列 → 保持原样 (自然 0 命中, 不猜)
+        let mut c = parse_query("nosuch=1");
+        normalize_clause_keys(&mut c, &schema);
+        assert_eq!(c, vec![field("nosuch", "1")]);
+
+        // 多段 path (嵌套键) 不动 —— spec D6 边界
+        let mut c = parse_query("a.b=1");
+        normalize_clause_keys(&mut c, &schema);
+        assert_eq!(
+            c,
+            vec![Clause::Field {
+                path: vec!["a".into(), "b".into()],
+                op: Op::Eq,
+                value: "1".into(),
+            }]
+        );
+
+        // 裸词不带键, 不受影响
+        let mut c = parse_query("ERROR");
+        normalize_clause_keys(&mut c, &schema);
+        assert_eq!(c, vec![Clause::Bare("ERROR".into())]);
+
+        // 端到端: 规范化后大写键名真的能筛出小写列名文件
+        let lf = open_with(b"{\"level\":\"ERROR\"}\n{\"level\":\"INFO\"}\n");
+        let mut c = parse_query("LEVEL=ERROR");
+        normalize_clause_keys(&mut c, &schema);
+        assert_eq!(run_filter(&lf, &c), vec![0]);
+    }
+
+    #[test]
+    fn nested_key_stays_case_sensitive_but_value_does_not() {
+        let lf = open_with(b"{\"user\":{\"Level\":\"ERROR\"}}\n");
+        // 值不敏感
+        assert_eq!(run_filter(&lf, &parse_query("user.Level=error")), vec![0]);
+        // 嵌套键保持精确 (spec D6 边界): 键写错大小写 → 不命中
+        assert_eq!(
+            run_filter(&lf, &parse_query("user.level=error")),
+            Vec::<u64>::new(),
+            "嵌套键不敏感化 (边界, 写明为敏感)"
+        );
+    }
+
+    #[test]
     fn token_matches_eq_and_prefix() {
         assert!(token_matches(b"500", Op::Eq, "500"));
         assert!(!token_matches(b"500", Op::Eq, "50"));
@@ -1143,5 +1311,139 @@ mod tests {
         assert_eq!(hits, vec![1, 2], "前缀通配");
         let hits = run_filter(&lf, &[]);
         assert_eq!(hits.len(), 4, "空查询 = 全量");
+    }
+
+    #[test]
+    fn bare_word_is_case_insensitive() {
+        let lf = open_with(
+            b"2026-09-05 ERROR boom\n\
+              2026-09-05 error soft\n\
+              2026-09-05 Error Mixed\n\
+              2026-09-05 WARN ok\n",
+        );
+        // 四种输入的**文件内容**大小写各异, 同一个词必须命中同样 3 行
+        for q in ["error", "ERROR", "Error", "eRrOr"] {
+            assert_eq!(
+                run_filter(&lf, &parse_query(q)),
+                vec![0, 1, 2],
+                "裸词 {q} 应大小写不敏感"
+            );
+        }
+        assert_eq!(
+            run_filter(&lf, &parse_query("error boom")),
+            vec![0],
+            "多裸词 AND, 逐词都不敏感"
+        );
+    }
+
+    #[test]
+    fn bare_word_does_not_fold_across_multibyte_bytes() {
+        // 非 UTF-8 文件不过转码, 匹配发生在字节面 —— 折叠只碰 ASCII, 不进多字节内部。
+        // 0xE9 不是 'e' 的折叠伙伴 (那是 Latin-1 的 é, 与 ASCII 折叠无关)。
+        let lf = open_with(&[
+            0xE9, b'r', b'r', b'o', b'r', b'\n', b'E', b'R', b'R', b'O', b'R', b'\n',
+        ]);
+        assert_eq!(
+            run_filter(&lf, &parse_query("error")),
+            vec![1],
+            "非 ASCII 首字节不得折叠成 ASCII 字母"
+        );
+        // 汉字查询词 (多字节) 照常按字节命中, 不受折叠影响
+        // (第二行**不能**含「中文」子串 —— 否则测的是子串语义不是这里要验的折叠)
+        let lf = open_with("中文error日志\n纯汉字一行\n".as_bytes());
+        assert_eq!(run_filter(&lf, &parse_query("中文")), vec![0]);
+        assert_eq!(run_filter(&lf, &parse_query("汉字")), vec![1]);
+        assert_eq!(run_filter(&lf, &parse_query("ERROR")), vec![0]);
+    }
+
+    /// oracle: `(?i-u)` 对字面串的语义 —— ASCII 字母展开成双变体类, 其余字节按原值。
+    /// 手写 [`contains_ascii_ci`] 的正确性全靠这条对拍。
+    fn ci_oracle(needle: &[u8]) -> regex::bytes::Regex {
+        let mut pat = String::from("(?-u)");
+        for &b in needle {
+            if b.is_ascii_alphabetic() {
+                let lo = b.to_ascii_lowercase() as char;
+                let up = b.to_ascii_uppercase() as char;
+                pat.push_str(&format!("[{lo}{up}]"));
+            } else {
+                // `(?-u)` 下 \xNN 是原始字节; 缺了它 \xE9 会展开成 UTF-8 码点
+                pat.push_str(&format!("\\x{b:02X}"));
+            }
+        }
+        regex::bytes::Regex::new(&pat).unwrap()
+    }
+
+    /// 字母表所有定长串 (穷举用)。
+    fn all_strings(alphabet: &[u8], len: usize) -> Vec<Vec<u8>> {
+        let mut out = vec![Vec::new()];
+        for _ in 0..len {
+            let mut next = Vec::with_capacity(out.len() * alphabet.len());
+            for s in &out {
+                for &b in alphabet {
+                    let mut t = s.clone();
+                    t.push(b);
+                    next.push(t);
+                }
+            }
+            out = next;
+        }
+        out
+    }
+
+    #[test]
+    fn contains_ascii_ci_matches_regex_oracle_exhaustively() {
+        // 字母表含**非 ASCII 字节** —— 「非 ASCII 不折叠」是本函数的关键语义,
+        // 只测 ASCII 的话漏掉它照样全绿。
+        // 大小写**两组都放** (a/A 与 b/B): 只放 `a`/`A` 时 `b` 那一支的折叠
+        // 全靠运气撞上, 对称覆盖才对得起「穷举」二字。
+        const ALPHABET: [u8; 5] = [b'a', b'A', b'b', b'B', 0xE9];
+        let mut haystacks = Vec::new();
+        for n in 0..=4 {
+            haystacks.extend(all_strings(&ALPHABET, n));
+        }
+        // needle 到 2 就够: 本函数的逻辑分支按「空 / 单字节 / 有 rest」三态分,
+        // 更长的 needle 测的是同一段 `eq_ignore_ascii_case`, 不增覆盖。位置多变体
+        // (贴边、重叠候选) 由 haystack 侧 0..=4 提供 —— 那才是微妙处。
+        // 实测: 收到 ≤2 后对拍约 2.4 万组, 套件耗时回到秒内 (≤3 时是 12 万组 / 5 秒)。
+        let mut needles = Vec::new();
+        for n in 0..=2 {
+            needles.extend(all_strings(&ALPHABET, n));
+        }
+        let mut checked = 0usize;
+        for h in &haystacks {
+            for nd in &needles {
+                assert_eq!(
+                    contains_ascii_ci(h, nd),
+                    ci_oracle(nd).is_match(h),
+                    "haystack={h:?} needle={nd:?}"
+                );
+                checked += 1;
+            }
+        }
+        assert!(checked > 20_000, "对拍规模缩水: 只跑了 {checked} 组");
+    }
+
+    #[test]
+    fn contains_ascii_ci_edge_cases() {
+        assert!(contains_ascii_ci(b"anything", b""), "空 needle 处处命中");
+        assert!(contains_ascii_ci(b"", b""), "空 vs 空");
+        assert!(!contains_ascii_ci(b"", b"a"), "空 haystack");
+        assert!(!contains_ascii_ci(b"ab", b"abc"), "needle 比 haystack 长");
+        assert!(contains_ascii_ci(b"ERROR level", b"error"));
+        assert!(contains_ascii_ci(b"error level", b"ERROR"));
+        assert!(contains_ascii_ci(b"Error", b"eRRoR"));
+        assert!(!contains_ascii_ci(b"ERRO level", b"ERROR"), "差一个字符");
+        // 贴边: 窗口起点恰在上界 / needle 即整个 haystack
+        assert!(contains_ascii_ci(b"xxERR", b"err"));
+        assert!(contains_ascii_ci(b"ERR", b"err"));
+        // 重叠候选: 首字节命中但验窗失败后必须继续找, 不能停在第一个候选上
+        assert!(contains_ascii_ci(b"aab", b"ab"), "首个候选失败后须继续");
+        assert!(contains_ascii_ci(b"aaaab", b"aaab"));
+        // 非 ASCII 字节不折叠: 0xC9 不是 0xE9 的对应大小写
+        assert!(!contains_ascii_ci(&[0xC9], &[0xE9]), "非 ASCII 不折叠");
+        assert!(contains_ascii_ci(&[0xC3, 0x89], &[0xC3, 0x89]));
+        // 汉字 (UTF-8 多字节) 不受影响
+        assert!(contains_ascii_ci("中文error日志".as_bytes(), b"ERROR"));
+        assert!(!contains_ascii_ci("中文日志".as_bytes(), b"error"));
     }
 }
