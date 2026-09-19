@@ -8,3 +8,4 @@
 
 pub mod jsonl;
 pub mod logfile;
+pub mod scan;
