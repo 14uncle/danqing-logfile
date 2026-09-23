@@ -360,6 +360,14 @@ impl LogFile {
         self.encoding
     }
 
+    /// 存储字节快照 (mmap 原样; UTF-16 为打开时转码的 UTF-8 副本 —— 见 [`Self::encoding`])。
+    ///
+    /// 定位: 导出「全集整拷」路径 (SPEC-v1x-export D3) —— 直接写盘即为字节保真的
+    /// 全集导出, 含原行尾/无终行尾/混合行尾, 零重构损耗。零拷贝借用, 不复制。
+    pub fn bytes(&self) -> &[u8] {
+        self.data.as_bytes()
+    }
+
     /// 第 i 行原始字节 (不含 `\n` / `\r`)。越界返回空片。
     ///
     /// 定位: 二分段基准定段 → 段内步进表 → memchr 前扫 (local % STRIDE) 个换行。
