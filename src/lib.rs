@@ -8,4 +8,6 @@
 
 pub mod jsonl;
 pub mod logfile;
+pub mod merge;
 pub mod scan;
+pub mod timestamp;
