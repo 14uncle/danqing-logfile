@@ -56,7 +56,8 @@ impl MergeIndex {
         &self.rows
     }
 
-    /// 驻留字节 (D10 实测口径 = 行数 ×16B; Vec 精确容量, 无超募)。
+    /// 驻留字节 (D10 口径 = 行数 ×16B)。**不含**建索引时为增量追加留的位
+    /// ([`APPEND_SLACK_DIV`], ≤6.25%) —— 口径仍是「16 B/行」, 超募单列。
     pub fn index_bytes(&self) -> usize {
         self.rows.len() * size_of::<MergeRow>()
     }
@@ -131,40 +132,105 @@ pub fn extract_append(
     }
 }
 
-/// 增量插入回找上限 (文档化兜底): 新行天然近尾 (live-tail 追加), 回找是常数级;
-/// 慢时钟源深回找超此帽即插在当前位置 —— 近似位, 注释即声明, 不静默错。
+/// 摘除回找上限 (文档化兜底): 目标是**该源最后一行**, 天然近尾; 超此帽即判
+/// 找不到 → 调用方兜底全量重建 (诚实, 不静默留幽灵)。**只用于 [`MergeIndex::remove_row`]**
+/// —— 插入侧 T9 起不再设帽 (见 [`MergeIndex::insert_rows`])。
 const WALK_CAP: usize = 1_000_000;
+
+/// 排序键 (与归并 tie-break 同规则): (ts, src, line) 字典序。
+fn key_of(r: &MergeRow) -> (i64, u32, u32) {
+    (r.ts, r.src, r.line)
+}
+
+/// 索引容量追加留位分母 (T9): 建索引时多留 `total / 此值` 个槽位, live-tail
+/// 的增量插入不撞容量上限 —— 否则 `Vec` 的翻倍重分配会让一次追加拷整个索引
+/// (17M 行实测 ~80 ms) 且驻留翻倍。1/16 = 6.25% 超募, 掉出留位时才重分配一次。
+pub const APPEND_SLACK_DIV: usize = 16;
 
 impl MergeIndex {
     /// 单源增量合流 (live-tail 腿 F 引擎半): 新行 (ts, 文件行号) 按**源行序**给,
-    /// 逐行找位插入。排序键 = (ts, src, line) 字典序 —— 与归并 tie-break 同规则
-    /// (等 ts: 源序号小者先, 同源行号小者先)。尾追加快路: 新行 ≥ 当前尾行 →
-    /// 回找零步直接 push (live-tail 常态)。
+    /// **整批一次归并插入**。排序键 = (ts, src, line) 字典序 —— 与归并 tie-break
+    /// 同规则 (等 ts: 源序号小者先, 同源行号小者先); 等键时新行插在既有行**之后**
+    /// (与逐行插入同语义)。
+    ///
+    /// **为什么整批单遍** (T9 实测 3×1GiB 定案): 逐行 `Vec::insert` 每行付两笔 ——
+    /// 回找距离 + 该位置到尾部的位移, 都随**回找深度**走。批量追尾时新行互为障碍
+    /// (Σ 深度 ≈ k²/2: 4 MiB / 2.6 万行实测 **~750 ms**); 慢时钟源更糟 (深度触帽,
+    /// 每行常数 **2.45 ms**: 2 万行实测 **48 s**, 且落的是近似位)。整批形态把两笔
+    /// 合一: 一次回找定位 + **一趟反向合并** (写指针恒 ≥ 读指针, 原地覆盖安全),
+    /// 代价 O(批行数 + 回找深度)。
+    ///
+    /// **回找不再设帽** (T9 改判): 单遍下深回找只付一次 (2M 行 ≈ 数 ms), 于是
+    /// **插入位精确** —— 旧的「超帽插在近似位」语义退役 (spec Q5 回写)。
     ///
     /// 注意: 索引在乱序下不保证全局 ts 有序 (D1 钉住), 故不能用二分 ——
-    /// 从尾部线性回找是唯一诚实形态 (新行近尾, 代价常数级)。
+    /// 从尾部线性回找是唯一诚实形态。
     pub fn insert_rows(&mut self, src: u32, new_rows: &[(i64, u32)]) {
-        for &(ts, line) in new_rows {
-            let pos = self.find_slot(src, ts, line);
-            self.rows.insert(pos, MergeRow { ts, src, line });
+        if new_rows.is_empty() {
+            return;
+        }
+        // 批序 = (ts, line) 稳定序 (同源, 故 = 全键序); 等 ts 保文件行序。
+        let mut batch: Vec<MergeRow> = new_rows
+            .iter()
+            .map(|&(ts, line)| MergeRow { ts, src, line })
+            .collect();
+        batch.sort_by_key(|r| (r.ts, r.line));
+
+        let start = self.slot_of(batch[0]);
+        let (len, k) = (self.rows.len(), batch.len());
+        // 容量留位 (见 [`APPEND_SLACK_DIV`]): 走 `reserve_exact` 而非 `resize`
+        // 的翻倍增长 —— 一次追加拷整个索引是 UI 线程上 80 ms 级的可见代价。
+        if self.rows.capacity() < len + k {
+            self.rows.reserve_exact(k + len / APPEND_SLACK_DIV);
+        }
+        // 反向单遍合并: 结果区间 [start, len + k)。不变式 w == ti + bi ⇒ 写指针
+        // 恒 ≥ 读指针, 原地覆盖不丢数据; bi 归零时剩余头部已在正确位置。
+        self.rows.resize(len + k, batch[0]);
+        let (mut w, mut ti, mut bi) = (len + k, len, k);
+        while bi > 0 {
+            let take_batch = ti == start || key_of(&self.rows[ti - 1]) <= key_of(&batch[bi - 1]);
+            if take_batch {
+                self.rows[w - 1] = batch[bi - 1];
+                bi -= 1;
+            } else {
+                self.rows[w - 1] = self.rows[ti - 1];
+                ti -= 1;
+            }
+            w -= 1;
         }
     }
 
-    /// 插入位: 末行起回找, 首个排序键 ≤ 新行的位置之后。
-    fn find_slot(&self, src: u32, ts: i64, line: u32) -> usize {
+    /// 插入位: 末行起回找, 首个排序键 ≤ 给定行的位置**之后**。
+    /// 不设帽 (T9): 插入的深回找只付一次, 换来精确位。
+    fn slot_of(&self, r: MergeRow) -> usize {
+        let k = key_of(&r);
+        let mut i = self.rows.len();
+        while i > 0 && key_of(&self.rows[i - 1]) > k {
+            i -= 1;
+        }
+        i
+    }
+
+    /// 单源单行摘除 (live-tail 末行补全重提的另一半, T7): 追加把**无换行结尾**的
+    /// 旧末行补全后, 该行的 ts 可能改判 (残行解析失败曾继承上一行) —— 旧条目
+    /// 必须先摘再插, 否则同一 (src,line) 在索引里两条 (旧 ts 幽灵)。
+    ///
+    /// 尾端回找 (目标天然近尾 —— 它是该源最后一行); **超 [`WALK_CAP`] 没找到 =
+    /// false**, 调用方兜底全量重建 (诚实, 不静默留幽灵)。`Vec::remove` 的
+    /// 尾部位移是常数级。
+    pub fn remove_row(&mut self, src: u32, line: u32) -> bool {
         let mut i = self.rows.len();
         let mut walked = 0usize;
         while i > 0 && walked < WALK_CAP {
             let r = self.rows[i - 1];
-            let after =
-                r.ts > ts || (r.ts == ts && (r.src > src || (r.src == src && r.line > line)));
-            if !after {
-                break;
+            if r.src == src && r.line == line {
+                self.rows.remove(i - 1);
+                return true;
             }
             i -= 1;
             walked += 1;
         }
-        i
+        false
     }
 }
 
@@ -197,7 +263,12 @@ pub fn build_index_masked(timelines: &[SourceTimeline<'_>], visible: &[bool]) ->
 /// min-head 归并核: (源时间戳切片, **原源序号**) 序列 —— build 两个入口共用。
 fn merge_from(items: &[(&[i64], u32)]) -> MergeIndex {
     let total: usize = items.iter().map(|(ts, _)| ts.len()).sum();
-    let mut rows: Vec<MergeRow> = Vec::with_capacity(total);
+    // 容量 = 精确行数 + 追加留位 [`APPEND_SLACK_DIV`] (T9): live-tail 增量插入
+    // 若撞容量上限, `Vec::resize` 会按**翻倍**重分配 —— 17M 行索引一次追加即
+    // 从 259 MiB 翻到 519 MiB (破 D10「每行 16B」的模型 + 一次 80 ms 拷贝)。
+    // 预留守位让小追加零重分配, 驻留超募 ≤ 1/16 (D10 口径 = 行数×16B 仍精确,
+    // 超募单列)。
+    let mut rows: Vec<MergeRow> = Vec::with_capacity(total + total / APPEND_SLACK_DIV);
     let mut cur: Vec<usize> = vec![0; items.len()];
     loop {
         let mut best: Option<(i64, usize)> = None;
@@ -420,6 +491,35 @@ mod tests {
         std::fs::remove_file(&pc).ok();
     }
 
+    /// 末行补全重提的索引半 (T7): 摘掉 (src,line) 旧条目再插新 ts ——
+    /// 不摘会留双条 (旧 ts 幽灵)。摘不存在的行 = false (调用方兜底重建)。
+    #[test]
+    fn remove_row_then_reinsert_corrects_tail_ts() {
+        let pa = temp_log("rm-a", b"l\nl\n");
+        let pb = temp_log("rm-b", b"l\n");
+        let fa = open(&pa);
+        let fb = open(&pb);
+        // 源0 行1 曾以**继承 ts** (200, 残行改判前) 进索引
+        let mut idx = build_index(&[
+            timeline_of(&fa, vec![100, 200]),
+            timeline_of(&fb, vec![150]),
+        ]);
+        assert!(idx.remove_row(0, 1), "末行补全: 旧条目摘得到");
+        idx.insert_rows(0, &[(400, 1)]); // 补全后真 ts
+        let got: Vec<(i64, u32, u32)> = idx.rows().iter().map(|r| (r.ts, r.src, r.line)).collect();
+        assert_eq!(
+            got,
+            vec![(100, 0, 0), (150, 1, 0), (400, 0, 1)],
+            "摘旧插新, 无幽灵条目"
+        );
+        // 摘得到 (条目以新 ts 在索引里): 再摘成功, 剩两行; 越界行 false
+        assert!(idx.remove_row(0, 1), "新条目同样可摘");
+        assert_eq!(idx.rows().len(), 2);
+        assert!(!idx.remove_row(1, 99), "越界行 false");
+        std::fs::remove_file(&pa).ok();
+        std::fs::remove_file(&pb).ok();
+    }
+
     #[test]
     fn build_index_masked_keeps_original_src_ids() {
         let pa = temp_log("mask-a", b"l\n");
@@ -440,5 +540,118 @@ mod tests {
         std::fs::remove_file(&pa).ok();
         std::fs::remove_file(&pb).ok();
         std::fs::remove_file(&pc).ok();
+    }
+
+    /// T9 整批插入与**逐行插入**逐位等价 (差分对拍): 参考实现 = 旧逐行语义
+    /// (每行对当时的数组算「首个键 ≤ 它的位置之后」)。覆盖尾追、深回找、
+    /// 批内乱序 (ts 逆序)、等 ts 相邻、索引内乱序多源 —— 整批是优化不改语义。
+    #[test]
+    fn insert_rows_batch_matches_per_row_reference() {
+        /// 旧逐行语义的参考实现 (与 T9 前的 `find_slot` 同判据)。
+        fn reference(rows: &mut Vec<(i64, u32, u32)>, src: u32, batch: &[(i64, u32)]) {
+            for &(ts, line) in batch {
+                let k = (ts, src, line);
+                let mut i = rows.len();
+                while i > 0 && rows[i - 1] > k {
+                    i -= 1;
+                }
+                rows.insert(i, k);
+            }
+        }
+        // (各源 ts 向量, 批目标源, 批行)
+        type Case = (Vec<Vec<i64>>, u32, Vec<(i64, u32)>);
+        let cases: Vec<Case> = vec![
+            // 尾追 (快路)
+            (vec![vec![100, 200, 300]], 0, vec![(400, 2), (500, 3)]),
+            // 深回找 (慢时钟源)
+            (vec![vec![100, 200, 300]], 0, vec![(50, 2), (60, 3)]),
+            // 批内 ts 逆序 (乱序行; 批按文件序给)
+            (
+                vec![vec![100, 300, 500]],
+                0,
+                vec![(400, 1), (200, 2), (600, 3)],
+            ),
+            // 等 ts 相邻 (批内三种关系: 小于/等于/大于既有同行 ts)
+            (vec![vec![100, 100, 100]], 0, vec![(100, 1), (100, 2)]),
+            // 多源 + 索引内乱序 (D1: 同源后行 ts 可回跳)
+            (
+                vec![vec![100, 400, 300], vec![250, 350]],
+                0,
+                vec![(320, 2), (450, 3)],
+            ),
+            // 批插中段 (首行不在尾也不在头)
+            (
+                vec![vec![100, 500, 900], vec![200, 600]],
+                1,
+                vec![(300, 2), (700, 3)],
+            ),
+        ];
+        for (bases, src, batch) in cases {
+            let mut files: Vec<(PathBuf, LogFile)> = Vec::new();
+            for (i, ts) in bases.iter().enumerate() {
+                let p = temp_log(&format!("diff-{i}"), &b"l\n".repeat(ts.len()));
+                let f = open(&p);
+                files.push((p, f));
+            }
+            let tls: Vec<SourceTimeline<'_>> = files
+                .iter()
+                .zip(bases.iter())
+                .map(|((_, f), ts)| timeline_of(f, ts.clone()))
+                .collect();
+            let mut idx = build_index(&tls);
+            let mut want: Vec<(i64, u32, u32)> =
+                idx.rows().iter().map(|r| (r.ts, r.src, r.line)).collect();
+            reference(&mut want, src, &batch);
+            idx.insert_rows(src, &batch);
+            let got: Vec<(i64, u32, u32)> =
+                idx.rows().iter().map(|r| (r.ts, r.src, r.line)).collect();
+            assert_eq!(got, want, "整批 == 逐行 (src={src}, batch={batch:?})");
+            for (p, _) in files {
+                std::fs::remove_file(&p).ok();
+            }
+        }
+    }
+
+    /// T9 容量留位: 建索引多留 `APPEND_SLACK_DIV` 之一, 小追加**不重分配**
+    /// (指针/容量不变) —— 否则 Vec 翻倍增长会让一次追加拷整个索引。
+    #[test]
+    fn insert_rows_uses_reserved_slack_without_realloc() {
+        let pa = temp_log("slack-a", &b"l\n".repeat(1000));
+        let fa = open(&pa);
+        let ts: Vec<i64> = (0..1000).map(|i| 100 + i as i64).collect();
+        let mut idx = build_index(&[timeline_of(&fa, ts)]);
+        let cap0 = idx.rows.capacity();
+        assert!(
+            cap0 > idx.rows.len(),
+            "建索引须留追加位: cap {cap0} vs len {}",
+            idx.rows.len()
+        );
+        idx.insert_rows(0, &[(5000, 1000), (6000, 1001)]);
+        assert_eq!(idx.rows.capacity(), cap0, "留位内追加不重分配");
+        assert_eq!(idx.len(), 1002);
+        std::fs::remove_file(&pa).ok();
+    }
+
+    /// T9 深回找**精确位** (旧帽语义退役): 新行真值位在 120 万行之外 ——
+    /// 旧实现超帽即插在 len-1M 的近似位, 现按真值位落最前。
+    #[test]
+    fn insert_rows_deep_walkback_is_exact_not_capped() {
+        // ts 向量直喂, 但 fixture 行数须与 ts 等长 (timeline_of 断言)
+        let n = 1_200_000usize;
+        let pa = temp_log("deep-a", &b"l\n".repeat(n));
+        let fa = open(&pa);
+        let ts: Vec<i64> = (0..n).map(|i| 100 + i as i64).collect();
+        let mut idx = build_index(&[timeline_of(&fa, ts)]);
+        assert_eq!(idx.len(), n);
+        // 源0 追加行 n, ts 比现存全部行都小 → 真值位 0
+        idx.insert_rows(0, &[(50, n as u32)]);
+        let first = idx.rows()[0];
+        assert_eq!(
+            (first.ts, first.src, first.line),
+            (50, 0, n as u32),
+            "深回找落真值位 (超帽近似位已退役)"
+        );
+        assert_eq!(idx.len(), n + 1);
+        std::fs::remove_file(&pa).ok();
     }
 }
